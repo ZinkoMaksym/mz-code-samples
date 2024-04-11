@@ -248,115 +248,107 @@ public async Task ProcessBankDailyFiles(bool isLambda)
     for (var i = 1; i <= daysDiff; i++)
     {
         var iterationDate = dateLastProcessed.AddDays(i);
-        if(iterationDate.DayOfWeek != DayOfWeek.Saturday && iterationDate.DayOfWeek != DayOfWeek.Sunday)
+        if (iterationDate.DayOfWeek == DayOfWeek.Saturday || iterationDate.DayOfWeek == DayOfWeek.Sunday)
+            continue;
+
+        try
         {
-            try
+            var generalFileName = $"TXNDDA_PAYVERSE_{iterationDate:yyyyMMdd}";
+
+            await AddLog($"{methodPrefix} Start file download process for date {iterationDate:yyyy-MM-dd}.");
+
+            _bankCommunicationService.CreateSftpClient(isLambda);
+
+            var generalDownloadResult = await _bankCommunicationService.DownloadFile(filePath, generalFileName);
+
+            await AddLog($@"{methodPrefix} TXN/DDA Download result - {generalDownloadResult.Success}");
+
+            var bankCsvProcessor = new bankCsvProcessor(_mccSettings);
+
+            if (generalDownloadResult.Success)
             {
-                var generalFileName = $"TXNDDA_PAYVERSE_{iterationDate:yyyyMMdd}";
+                var file = (SFTP.SFTPFile)generalDownloadResult.ResultData;
 
-                await AddLog($"{methodPrefix} Start file download process for date {iterationDate:yyyy-MM-dd}.");
+                await AddLog($"{methodPrefix}TXN file saving for backup.");
+                _s3Client = new AWS_S3(_mccSettings, _dbContext);
 
-                _bankCommunicationService.CreateSftpClient(isLambda);
+                var filePathToSaveBackup = $"Settlement/ACHFiles/bank_CUP/processed/{generalFileName}.csv.pgp";
+                await using var memoryStream = new MemoryStream(file.FileByte);
+                await _s3Client.UploadObject(filePathToSaveBackup, memoryStream);
 
-                var generalDownloadResult = await _bankCommunicationService.DownloadFile(filePath, generalFileName);
+                var balances = (await bankCsvProcessor.ConvertTxnDdaFileToObject(file.FileByte, isLambda))?.ToList();
 
-                await AddLog($@"{methodPrefix} TXN/DDA Download result - {generalDownloadResult.Success}");
+                await AddLog($"{methodPrefix} TXN/DDA records were successfully parsed, count - {balances.Count}");
 
-                var bankCsvProcessor = new bankCsvProcessor(_mccSettings);
+                if (!balances.Any())
+                    continue;
 
-                if (generalDownloadResult.Success)
+                var existingRecords = await _bankAccountBalanceProvider
+                    .Get($"PostedDate = '{balances.First().PostedDate.GetValueOrDefault().Date:yyyy-MM-dd}'");
+
+                if (existingRecords is null || !existingRecords.Any())
+                    continue;
+
+                var insertRecords = balances.Where(x =>
+                x.AvailableBalance is not null && x.PostedDate is not null).Select(x => new BankAccountBalance
                 {
-                    var file = (SFTP.SFTPFile)generalDownloadResult.ResultData;
+                    TransactionItem = x.TransactionItem,
+                    DDAAccount = x.DDAAccount,
+                    PostedDate = x.PostedDate,
+                    TransactionCode = x.TransactionCode?.Trim(),
+                    TransactionAmount = x.TransactionAmount,
+                    TransactionDescription = x.TransactionDescription,
+                    AvailableBalance = x.AvailableBalance,
+                    TransactionTypeId = GetTransactionType(x.TransactionDescription)
+                }).ToList();
 
-                    try
+                await _bankAccountBalanceProvider.InsertBulk(insertRecords);
+
+                await AddLog($"{methodPrefix} Bank accounts balances inserted successfully. Count - {insertRecords.Count}");
+
+                var returns = insertRecords.Where(x => x.TransactionTypeId == (int)BankAccountTransactionTypes.Returns).ToList();
+
+                if (returns is not null && returns.Any())
+                {
+                    var date = insertRecords.First().PostedDate.GetValueOrDefault().Date.ToString("MM-dd-yyyy");
+                    foreach (var returnRecord in returns)
                     {
-                        await AddLog($"{methodPrefix}TXN file saving for backup.");
-                        _s3Client = new AWS_S3(_mccSettings, _dbContext);
 
-                        var filePathToSaveBackup = $"Settlement/ACHFiles/bank_CUP/processed/{generalFileName}.csv.pgp";
-                        await using var memoryStream = new MemoryStream(file.FileByte);
-                        await _s3Client.UploadObject(filePathToSaveBackup, memoryStream);
+                        var subject = $"Returns from bank on {date}, item: {returnRecord.TransactionItem}.";
 
-                    }
-                    catch (Exception ex)
-                    {
-                        await AddLog($"{methodPrefix}TXN file saving for backup error - {ex.Message}.");
-                    }
+                        var body = $@"Return from bank was received. Date: {date}; 
+		                            Transaction item: {returnRecord.TransactionItem};
+		                            Return Amount: {returnRecord.TransactionAmount}; 
+		                            Description: {returnRecord.TransactionDescription}.";
 
-                    var balances = (await bankCsvProcessor.ConvertTxnDdaFileToObject(file.FileByte, isLambda))?.ToList();
-
-                    await AddLog($"{methodPrefix} TXN/DDA records were successfully parsed, count - {balances.Count}");
-
-                    if (balances.Any())
-                    {
-                        var existingRecords = await _bankAccountBalanceProvider
-                            .Get($"PostedDate = '{balances.First().PostedDate.GetValueOrDefault().Date:yyyy-MM-dd}'");
-
-                        if (existingRecords is null || !existingRecords.Any())
+                        var emailObj = new EmailQueue
                         {
-                            var insertRecords = balances.Where(x => 
-                                x.AvailableBalance is not null && x.PostedDate is not null).Select(x => new BankAccountBalance
-                            {
-                                TransactionItem = x.TransactionItem,
-                                DDAAccount = x.DDAAccount,
-                                PostedDate = x.PostedDate,
-                                TransactionCode = x.TransactionCode?.Trim(),
-                                TransactionAmount = x.TransactionAmount,
-                                TransactionDescription = x.TransactionDescription,
-                                AvailableBalance = x.AvailableBalance,
-                                TransactionTypeId = GetTransactionType(x.TransactionDescription)
-                            }).ToList();
+                            Receiver = _mccSettings.EmailNotificationSettings.UrgentAlert,
+                            Sender = _mccSettings.EmailNotificationSettings.NoReplyEmail,
+                            Subject = subject,
+                            Content = body
+                        };
 
-                            await _bankAccountBalanceProvider.InsertBulk(insertRecords);
-
-                            await AddLog($"{methodPrefix} Bank accounts balances inserted successfully. Count - {insertRecords.Count}");
-
-                            var returns = insertRecords.Where(x => x.TransactionTypeId == (int)BankAccountTransactionTypes.Returns).ToList();
-
-                            if(returns is not null && returns.Any())
-                            {
-                                var date = insertRecords.First().PostedDate.GetValueOrDefault().Date.ToString("MM-dd-yyyy");
-                                foreach (var returnRecord in returns)
-                                {
-
-                                    var subject = $"Returns from bank on {date}, item: {returnRecord.TransactionItem}.";
-
-                                    var body = $@"Return from bank was received. Date: {date}; 
-                                                Transaction item: {returnRecord.TransactionItem};
-                                                Return Amount: {returnRecord.TransactionAmount}; 
-                                                Description: {returnRecord.TransactionDescription}.";
-
-                                    var emailObj = new EmailQueue
-                                    {
-                                        Receiver = _mccSettings.EmailNotificationSettings.UrgentAlert,
-                                        Sender = _mccSettings.EmailNotificationSettings.NoReplyEmail,
-                                        Subject = subject,
-                                        Content = body
-                                    };
-
-                                    await _emailQueueProvider.InsertEmailQueue(emailObj);
-                                }
-                            }
-                        }
+                        await _emailQueueProvider.InsertEmailQueue(emailObj);
                     }
-
-                    var sourceFilePath = $"{filePath}/{generalFileName}";
-                    var destinationFilePath = $"{filePath}/processed/{generalFileName}";
-                    await _bankCommunicationService.MoveFile(sourceFilePath, destinationFilePath);
                 }
 
-            }
-            catch (Exception ex)
-            {
-                await AddLog($"{methodPrefix}[{iterationDate:yyyMMdd}] Exception: {ex.Message}", true);
-
-                //throw in order to not iterate again and hold the last successfull processed date
-                throw;
+                var sourceFilePath = $"{filePath}/{generalFileName}";
+                var destinationFilePath = $"{filePath}/processed/{generalFileName}";
+                await _bankCommunicationService.MoveFile(sourceFilePath, destinationFilePath);
             }
 
-            await _systemConfigurationProvider.UpdateConfig(SystemConfiguration.BalancesDateProcessed, iterationDate.ToString());
         }
-	}
+        catch (Exception ex)
+        {
+            await AddLog($"{methodPrefix}[{iterationDate:yyyMMdd}] Exception: {ex.Message}", true);
+
+            //throw in order to not iterate again and hold the last successfull processed date
+            throw;
+        }
+
+        await _systemConfigurationProvider.UpdateConfig(SystemConfiguration.BalancesDateProcessed, iterationDate.ToString());
+    }
 }
 
 
